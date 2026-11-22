@@ -1,0 +1,95 @@
+name: CD - Build, Push & Deploy to Azure Container Apps
+
+on:
+  workflow_dispatch: # Allows manual trigger from GitHub Actions UI anytime
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'Dockerfile'
+      - '.dockerignore'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  test:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r src/requirements.txt
+
+      - name: Run Test Suite
+        run: python -m unittest discover tests
+
+  build-and-deploy:
+    name: Build, Push to Docker Hub & Deploy to ACA
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.repository == '1-Anand/azure-genai-idp-platform' # Prevents forks from attempting deployment
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/azure-genai-idp-engine
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy Image to Azure Container Apps
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            IMAGE_TAG="${{ secrets.DOCKERHUB_USERNAME }}/azure-genai-idp-engine:sha-${{ steps.meta.outputs.version }}"
+            echo "Deploying image: ${IMAGE_TAG} to Azure Container App..."
+            
+            az containerapp update \
+              --name ca-genai-idp-engine \
+              --resource-group rg-genai-idp-dev \
+              --image ${IMAGE_TAG}
+
+            FQDN=$(az containerapp show --name ca-genai-idp-engine --resource-group rg-genai-idp-dev --query "properties.configuration.ingress.fqdn" -o tsv)
+            echo "Deployment successful!"
+            echo "Application URL: https://${FQDN}"
+            echo "Swagger UI: https://${FQDN}/docs"
+            echo "Health check endpoint: https://${FQDN}/health"
