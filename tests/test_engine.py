@@ -1,6 +1,7 @@
+import io
 import unittest
-from unittest.mock import MagicMock
-from src.app import extract_invoice_fields, app
+from unittest.mock import MagicMock, patch
+from src.app import extract_invoice_fields, verify_audit_rules, app
 from fastapi.testclient import TestClient
 
 class TestInvoiceEngine(unittest.TestCase):
@@ -57,6 +58,77 @@ class TestInvoiceEngine(unittest.TestCase):
         self.assertEqual(result["InvoiceTotal"]["confidence"], 0.92)
         self.assertIsNone(result["InvoiceId"]["value"])
         self.assertEqual(result["InvoiceId"]["confidence"], 0.0)
+
+    def test_deterministic_confidence_guardrail(self):
+        # Raw data with low confidence on InvoiceId
+        raw_data = {
+            "VendorName": {"value": "Acme Inc", "confidence": 0.95},
+            "InvoiceId": {"value": "INV-100", "confidence": 0.65}, # Below 0.85
+            "InvoiceTotal": {"value": "100.00", "confidence": 0.90},
+            "SubTotal": {"value": "90.00", "confidence": 0.90},
+            "TotalTax": {"value": "10.00", "confidence": 0.90}
+        }
+        llm_payload = {
+            "needs_human_review": False,
+            "math_check_passed": True,
+            "routing_reason": "LLM passed"
+        }
+        verified = verify_audit_rules(raw_data, llm_payload)
+        self.assertTrue(verified["needs_human_review"])
+        self.assertIn("below 0.85 threshold", verified["routing_reason"])
+
+    def test_deterministic_arithmetic_guardrail(self):
+        # Subtotal (100) + Tax (10) != Total (150)
+        raw_data = {
+            "VendorName": {"value": "Acme Inc", "confidence": 0.95},
+            "InvoiceId": {"value": "INV-100", "confidence": 0.95},
+            "InvoiceTotal": {"value": "$150.00", "confidence": 0.95},
+            "SubTotal": {"value": "$100.00", "confidence": 0.95},
+            "TotalTax": {"value": "$10.00", "confidence": 0.95}
+        }
+        llm_payload = {
+            "needs_human_review": False,
+            "math_check_passed": True,
+            "routing_reason": ""
+        }
+        verified = verify_audit_rules(raw_data, llm_payload)
+        self.assertFalse(verified["math_check_passed"])
+        self.assertTrue(verified["needs_human_review"])
+        self.assertIn("Arithmetic check failed", verified["routing_reason"])
+
+    def test_upload_unsupported_media_type(self):
+        file_content = b"fake executable content"
+        response = self.client.post(
+            "/analyze-invoice",
+            files={"file": ("test.exe", io.BytesIO(file_content), "application/x-msdownload")}
+        )
+        self.assertEqual(response.status_code, 415)
+        self.assertIn("Unsupported media type", response.json()["detail"])
+
+    def test_upload_empty_file(self):
+        response = self.client.post(
+            "/analyze-invoice",
+            files={"file": ("empty.pdf", io.BytesIO(b""), "application/pdf")}
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("empty", response.json()["detail"])
+
+    @patch("src.app.IDP_API_KEY", "secret-test-key")
+    def test_api_key_authentication(self):
+        # 1. Missing header -> 401
+        res_no_auth = self.client.post(
+            "/analyze-invoice",
+            files={"file": ("test.pdf", io.BytesIO(b"dummy pdf bytes"), "application/pdf")}
+        )
+        self.assertEqual(res_no_auth.status_code, 401)
+
+        # 2. Wrong header -> 401
+        res_wrong_auth = self.client.post(
+            "/analyze-invoice",
+            headers={"X-API-Key": "wrong-key"},
+            files={"file": ("test.pdf", io.BytesIO(b"dummy pdf bytes"), "application/pdf")}
+        )
+        self.assertEqual(res_wrong_auth.status_code, 401)
 
 if __name__ == "__main__":
     unittest.main()

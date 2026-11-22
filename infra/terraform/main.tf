@@ -3,7 +3,7 @@ resource "azurerm_resource_group" "rg" {
   location = var.location
 }
 
-# Azure AI Document Intelligence (Custom subdomain required for Entra ID authentication)
+# Azure AI Document Intelligence (Enforces Zero-Key passwordless Entra ID authentication)
 resource "azurerm_cognitive_account" "docint" {
   name                  = "docint-idp-dev-01"
   location              = azurerm_resource_group.rg.location
@@ -11,9 +11,10 @@ resource "azurerm_cognitive_account" "docint" {
   kind                  = "FormRecognizer"
   sku_name              = "F0"
   custom_subdomain_name = "docint-idp-dev-01"
+  local_auth_enabled    = false
 }
 
-# Azure OpenAI Service + gpt-5-mini Deployment
+# Azure OpenAI Service + gpt-5-mini Deployment (Enforces Zero-Key passwordless Entra ID authentication)
 resource "azurerm_cognitive_account" "openai" {
   name                  = "aoai-idp-dev-01"
   location              = azurerm_resource_group.rg.location
@@ -21,6 +22,7 @@ resource "azurerm_cognitive_account" "openai" {
   kind                  = "OpenAI"
   sku_name              = "S0"
   custom_subdomain_name = "aoai-idp-dev-01"
+  local_auth_enabled    = false
 }
 
 resource "azurerm_cognitive_deployment" "gpt5_mini" {
@@ -86,6 +88,10 @@ resource "azurerm_container_app" "app" {
       env {
         name  = "AZURE_OPENAI_DEPLOYMENT"
         value = azurerm_cognitive_deployment.gpt5_mini.name
+      }
+      env {
+        name  = "IDP_API_KEY"
+        value = var.idp_api_key
       }
     }
   }

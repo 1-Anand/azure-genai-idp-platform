@@ -20,3 +20,10 @@ variable "openai_model_version" {
   type        = string
   default     = "2025-08-07"
 }
+
+variable "idp_api_key" {
+  description = "Optional API key for securing /analyze-invoice data-plane calls (leave empty for open dev mode)"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
