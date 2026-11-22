@@ -1,10 +1,13 @@
 import os
 import re
 import json
+import time
+import asyncio
 import logging
 import urllib.request
+from collections import defaultdict
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException, Security, status
+from fastapi import FastAPI, UploadFile, File, HTTPException, Security, Request, status
 from fastapi.security import APIKeyHeader
 from azure.core.credentials import AzureKeyCredential
 from azure.identity import DefaultAzureCredential
@@ -28,7 +31,7 @@ AOAI_KEY = os.getenv("AZURE_OPENAI_KEY")
 AOAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5-mini")
 IDP_API_KEY = os.getenv("IDP_API_KEY")
 
-# Security & DoS Prevention Thresholds
+# Security, Concurrency & DoS Prevention Thresholds
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB maximum payload limit
 ALLOWED_MEDIA_TYPES = {
     "application/pdf",
@@ -38,22 +41,54 @@ ALLOWED_MEDIA_TYPES = {
     "image/bmp"
 }
 
-# 2. Authentication Dependency (Protects public endpoint from unauthorized resource consumption)
+# Concurrency throttle: maximum 2 concurrent OCR/LLM operations in 0.5 GiB container
+PROCESSING_SEMAPHORE = asyncio.Semaphore(2)
+
+# IP-based sliding window rate limiter (max 15 requests per minute per IP)
+RATE_LIMIT_WINDOW = 60.0  # seconds
+RATE_LIMIT_MAX_REQUESTS = 15
+_request_history = defaultdict(list)
+_history_lock = asyncio.Lock()
+
+async def enforce_rate_limit(request: Request):
+    """
+    In-memory rate limiter per client IP.
+    Protects the container from denial-of-service floods and runaway API costs.
+    """
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    now = time.time()
+    async with _history_lock:
+        timestamps = [t for t in _request_history[client_ip] if now - t < RATE_LIMIT_WINDOW]
+        if len(timestamps) >= RATE_LIMIT_MAX_REQUESTS:
+            logger.warning("Rate limit exceeded for client IP: %s (%d requests in window)", client_ip, len(timestamps))
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Rate limit exceeded. Maximum 15 requests per minute allowed."
+            )
+        timestamps.append(now)
+        _request_history[client_ip] = timestamps
+
+# 2. Strict Authentication Dependency (Fail-Closed by Default)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
     """
-    Enforces authentication on data-plane endpoints.
-    If IDP_API_KEY is configured in the environment, incoming requests must provide
-    a matching X-API-Key header.
+    Fail-closed authentication check.
+    - If IDP_API_KEY is missing/empty on the server, the endpoint is disabled (503).
+    - If X-API-Key does not match IDP_API_KEY, access is rejected (401).
     """
-    if IDP_API_KEY:
-        if not api_key or api_key != IDP_API_KEY:
-            logger.warning("Unauthorized access attempt: Invalid or missing X-API-Key header.")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized: Invalid or missing X-API-Key header."
-            )
+    if not IDP_API_KEY or IDP_API_KEY.strip() == "":
+        logger.error("Configuration error: IDP_API_KEY is not configured on server. Endpoint disabled.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service authentication is not configured. Data-plane processing is disabled."
+        )
+    if not api_key or api_key != IDP_API_KEY:
+        logger.warning("Unauthorized access attempt: Invalid or missing X-API-Key header.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Invalid or missing X-API-Key header."
+        )
     return api_key
 
 # 3. Document Intelligence Client (Zero-Key Managed Identity in Cloud)
@@ -162,29 +197,32 @@ def enrich_with_llm(raw_extraction: dict) -> dict:
         result = json.loads(resp.read().decode("utf-8"))
         return json.loads(result["choices"][0]["message"]["content"])
 
-# 6. Deterministic Guardrail: Independent Code-Level Verification (Ground-Truth Safety Net)
+# 6. Strict Deterministic Guardrail: Independent Code Verification
 def verify_audit_rules(raw_data: dict, llm_payload: dict) -> dict:
     """
     Independently verifies confidence thresholds and arithmetic consistency in application code.
-    Prevents hallucinations from accepting incorrect or unverified invoices as ERP-ready.
+    Fails safely when required fields are missing, unparseable, or mismatched.
     """
     reasons = []
     needs_review = llm_payload.get("needs_human_review", False)
     math_passed = llm_payload.get("math_check_passed", True)
 
-    # Rule 1: Independent Confidence Gating (< 0.85 on any critical field)
+    # Rule 1: Mandatory Field & Confidence Gating (< 0.85 on any critical field)
     critical_fields = ["VendorName", "InvoiceId", "InvoiceTotal"]
     for field_name in critical_fields:
         field_data = raw_data.get(field_name, {})
         conf = field_data.get("confidence", 0.0)
         val = field_data.get("value")
-        if val is None or conf < 0.85:
+        if val is None or str(val).strip() == "":
+            needs_review = True
+            reasons.append(f"Required field '{field_name}' is missing from document.")
+        elif conf < 0.85:
             needs_review = True
             reasons.append(f"Confidence for '{field_name}' ({conf:.3f}) is below 0.85 threshold.")
 
-    # Rule 2: Independent Arithmetic Verification (SubTotal + TotalTax == InvoiceTotal)
+    # Rule 2: Strict Arithmetic Verification (SubTotal + TotalTax == InvoiceTotal)
     def parse_amount(val) -> float | None:
-        if val is None:
+        if val is None or str(val).strip() == "":
             return None
         clean = re.sub(r"[^\d.-]", "", str(val))
         try:
@@ -192,19 +230,44 @@ def verify_audit_rules(raw_data: dict, llm_payload: dict) -> dict:
         except (ValueError, TypeError):
             return None
 
-    subtotal = parse_amount(raw_data.get("SubTotal", {}).get("value"))
-    tax = parse_amount(raw_data.get("TotalTax", {}).get("value")) or 0.0
-    total = parse_amount(raw_data.get("InvoiceTotal", {}).get("value"))
+    subtotal_raw = raw_data.get("SubTotal", {}).get("value")
+    tax_raw = raw_data.get("TotalTax", {}).get("value")
+    total_raw = raw_data.get("InvoiceTotal", {}).get("value")
+
+    subtotal = parse_amount(subtotal_raw)
+    tax = parse_amount(tax_raw)
+    total = parse_amount(total_raw)
+
+    # Require both SubTotal and InvoiceTotal for mathematical validation
+    if subtotal is None:
+        math_passed = False
+        needs_review = True
+        reasons.append("SubTotal is missing or unparseable; arithmetic could not be verified.")
+
+    if total is None:
+        math_passed = False
+        needs_review = True
+        reasons.append("InvoiceTotal is missing or unparseable; arithmetic could not be verified.")
 
     if subtotal is not None and total is not None:
-        computed = round(subtotal + tax, 2)
-        diff = abs(computed - round(total, 2))
-        if diff > 0.02:  # Tolerance of 2 cents for fractional rounding
-            math_passed = False
-            needs_review = True
-            reasons.append(f"Arithmetic check failed: SubTotal ({subtotal:.2f}) + TotalTax ({tax:.2f}) != InvoiceTotal ({total:.2f}).")
+        # If tax is omitted, check if subtotal equals total
+        if tax is None:
+            if abs(subtotal - total) > 0.02:
+                math_passed = False
+                needs_review = True
+                reasons.append(f"TotalTax is missing, and SubTotal ({subtotal:.2f}) does not match InvoiceTotal ({total:.2f}).")
+            else:
+                tax = 0.0
+                math_passed = True
         else:
-            math_passed = True
+            computed = round(subtotal + tax, 2)
+            diff = abs(computed - round(total, 2))
+            if diff > 0.02:  # Tolerance of 2 cents for fractional rounding
+                math_passed = False
+                needs_review = True
+                reasons.append(f"Arithmetic mismatch: SubTotal ({subtotal:.2f}) + TotalTax ({tax:.2f}) != InvoiceTotal ({total:.2f}).")
+            else:
+                math_passed = True
 
     # Merge code-level reasons with LLM output
     existing_reason = llm_payload.get("routing_reason", "")
@@ -232,7 +295,7 @@ async def root():
         "version": "1.0.0",
         "docs_url": "/docs",
         "health_url": "/health",
-        "auth_enabled": bool(IDP_API_KEY)
+        "auth_enabled": bool(IDP_API_KEY and IDP_API_KEY.strip())
     }
 
 @app.get("/health")
@@ -242,15 +305,19 @@ async def health_check():
         "service": "genai-idp-engine",
         "docint_configured": bool(DOCINT_ENDPOINT),
         "openai_configured": bool(AOAI_ENDPOINT),
-        "auth_enabled": bool(IDP_API_KEY)
+        "auth_enabled": bool(IDP_API_KEY and IDP_API_KEY.strip())
     }
 
 @app.post("/analyze-invoice")
 async def analyze_invoice(
+    request: Request,
     file: UploadFile = File(...),
     api_key: str = Security(verify_api_key)
 ):
-    # 1. Validate Media Type
+    # 1. Enforce Client IP Rate Limiting (15 req/min)
+    await enforce_rate_limit(request)
+
+    # 2. Validate Media Type
     content_type = file.content_type or "application/pdf"
     if content_type.lower() not in ALLOWED_MEDIA_TYPES:
         logger.warning("Rejected upload with unsupported media type: %s", content_type)
@@ -259,9 +326,9 @@ async def analyze_invoice(
             detail=f"Unsupported media type '{content_type}'. Allowed types: PDF, PNG, JPEG, TIFF, BMP."
         )
 
-    # 2. Enforce File Size Limit (Chunked Streaming to prevent OOM / DoS)
+    # 3. Enforce File Size Limit via 1MB Chunk Streaming (DoS / OOM protection)
     contents = bytearray()
-    while chunk := await file.read(1024 * 1024):  # Read in 1MB chunks
+    while chunk := await file.read(1024 * 1024):
         contents.extend(chunk)
         if len(contents) > MAX_FILE_SIZE:
             logger.warning("Rejected upload exceeding maximum size limit of %d bytes", MAX_FILE_SIZE)
@@ -277,33 +344,34 @@ async def analyze_invoice(
             detail="Uploaded file is empty."
         )
 
-    # 3. Process with Azure Document Intelligence & LLM Audit Pipeline
-    try:
-        doc_client = get_docint_client()
-        poller = doc_client.begin_analyze_document(
-            "prebuilt-invoice",
-            body=file_bytes,
-            content_type=content_type
-        )
-        raw_data = extract_invoice_fields(poller.result())
-        llm_payload = enrich_with_llm(raw_data)
+    # 4. Concurrency-throttled Processing with Azure Document Intelligence & OpenAI
+    async with PROCESSING_SEMAPHORE:
+        try:
+            doc_client = get_docint_client()
+            poller = doc_client.begin_analyze_document(
+                "prebuilt-invoice",
+                body=file_bytes,
+                content_type=content_type
+            )
+            raw_data = extract_invoice_fields(poller.result())
+            llm_payload = enrich_with_llm(raw_data)
 
-        # 4. Independent Deterministic Verification
-        verified_payload = verify_audit_rules(raw_data, llm_payload)
+            # 5. Independent Deterministic Verification
+            verified_payload = verify_audit_rules(raw_data, llm_payload)
 
-        return {
-            "raw_document_intelligence": raw_data,
-            "erp_validated_output": verified_payload
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        # Sanitize error to prevent leaking internal Azure subscription details to callers
-        logger.exception("Internal error processing invoice document: %s", str(e))
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An internal error occurred while processing the invoice. Diagnostic details have been logged privately."
-        )
+            return {
+                "raw_document_intelligence": raw_data,
+                "erp_validated_output": verified_payload
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            # Privately log detailed diagnostic trace without disclosing to clients
+            logger.exception("Internal error processing invoice document: %s", str(e))
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="An internal error occurred while processing the invoice. Diagnostic details have been logged privately."
+            )
 
 # 8. CLI Test Mode
 if __name__ == "__main__":

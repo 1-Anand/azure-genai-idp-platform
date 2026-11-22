@@ -60,10 +60,9 @@ class TestInvoiceEngine(unittest.TestCase):
         self.assertEqual(result["InvoiceId"]["confidence"], 0.0)
 
     def test_deterministic_confidence_guardrail(self):
-        # Raw data with low confidence on InvoiceId
         raw_data = {
             "VendorName": {"value": "Acme Inc", "confidence": 0.95},
-            "InvoiceId": {"value": "INV-100", "confidence": 0.65}, # Below 0.85
+            "InvoiceId": {"value": "INV-100", "confidence": 0.65},  # Below 0.85
             "InvoiceTotal": {"value": "100.00", "confidence": 0.90},
             "SubTotal": {"value": "90.00", "confidence": 0.90},
             "TotalTax": {"value": "10.00", "confidence": 0.90}
@@ -94,24 +93,39 @@ class TestInvoiceEngine(unittest.TestCase):
         verified = verify_audit_rules(raw_data, llm_payload)
         self.assertFalse(verified["math_check_passed"])
         self.assertTrue(verified["needs_human_review"])
-        self.assertIn("Arithmetic check failed", verified["routing_reason"])
+        self.assertIn("Arithmetic mismatch", verified["routing_reason"])
 
+    @patch("src.app.IDP_API_KEY", "test-key")
     def test_upload_unsupported_media_type(self):
         file_content = b"fake executable content"
         response = self.client.post(
             "/analyze-invoice",
+            headers={"X-API-Key": "test-key"},
             files={"file": ("test.exe", io.BytesIO(file_content), "application/x-msdownload")}
         )
         self.assertEqual(response.status_code, 415)
         self.assertIn("Unsupported media type", response.json()["detail"])
 
+    @patch("src.app.IDP_API_KEY", "test-key")
     def test_upload_empty_file(self):
         response = self.client.post(
             "/analyze-invoice",
+            headers={"X-API-Key": "test-key"},
             files={"file": ("empty.pdf", io.BytesIO(b""), "application/pdf")}
         )
         self.assertEqual(response.status_code, 400)
         self.assertIn("empty", response.json()["detail"])
+
+    @patch("src.app.IDP_API_KEY", "")
+    def test_fail_closed_when_unconfigured(self):
+        # When server has no IDP_API_KEY configured, data plane returns 503 Service Unavailable
+        response = self.client.post(
+            "/analyze-invoice",
+            headers={"X-API-Key": "any-key"},
+            files={"file": ("invoice.pdf", io.BytesIO(b"%PDF dummy"), "application/pdf")}
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("disabled", response.json()["detail"])
 
     @patch("src.app.IDP_API_KEY", "secret-test-key")
     def test_api_key_authentication(self):
@@ -129,6 +143,27 @@ class TestInvoiceEngine(unittest.TestCase):
             files={"file": ("test.pdf", io.BytesIO(b"dummy pdf bytes"), "application/pdf")}
         )
         self.assertEqual(res_wrong_auth.status_code, 401)
+
+    @patch("src.app.IDP_API_KEY", "rate-limit-test-key")
+    def test_rate_limiter(self):
+        # Send 15 requests (allowed)
+        for _ in range(15):
+            res = self.client.post(
+                "/analyze-invoice",
+                headers={"X-API-Key": "rate-limit-test-key", "x-forwarded-for": "192.168.1.100"},
+                files={"file": ("test.pdf", io.BytesIO(b""), "application/pdf")}
+            )
+            # Should reach validation (400 empty file), not 429
+            self.assertEqual(res.status_code, 400)
+
+        # 16th request must trigger 429 Too Many Requests
+        res_rate_limited = self.client.post(
+            "/analyze-invoice",
+            headers={"X-API-Key": "rate-limit-test-key", "x-forwarded-for": "192.168.1.100"},
+            files={"file": ("test.pdf", io.BytesIO(b""), "application/pdf")}
+        )
+        self.assertEqual(res_rate_limited.status_code, 429)
+        self.assertIn("Rate limit exceeded", res_rate_limited.json()["detail"])
 
 if __name__ == "__main__":
     unittest.main()

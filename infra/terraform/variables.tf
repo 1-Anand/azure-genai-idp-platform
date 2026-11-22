@@ -22,7 +22,7 @@ variable "openai_model_version" {
 }
 
 variable "idp_api_key" {
-  description = "Optional API key for securing /analyze-invoice data-plane calls (leave empty for open dev mode)"
+  description = "Optional custom API key for /analyze-invoice data-plane calls. If omitted, a secure 32-character key is automatically generated."
   type        = string
   sensitive   = true
   default     = ""

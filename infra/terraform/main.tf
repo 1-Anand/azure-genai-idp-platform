@@ -41,6 +41,16 @@ resource "azurerm_cognitive_deployment" "gpt5_mini" {
   }
 }
 
+# Generate secure random API key if not explicitly supplied
+resource "random_password" "api_key" {
+  length  = 32
+  special = false
+}
+
+locals {
+  effective_api_key = var.idp_api_key != "" ? var.idp_api_key : random_password.api_key.result
+}
+
 # Serverless Azure Container Apps (Scale-to-Zero + System-Assigned Managed Identity)
 resource "azurerm_container_app_environment" "env" {
   name                = "cae-genai-idp-dev"
@@ -58,6 +68,12 @@ resource "azurerm_container_app" "app" {
     type = "SystemAssigned"
   }
 
+  # Native ACA Secret Reference (Never exposes raw key plaintext in container definitions)
+  secret {
+    name  = "idp-api-key"
+    value = local.effective_api_key
+  }
+
   ingress {
     external_enabled = true
     target_port      = 8000
@@ -69,7 +85,12 @@ resource "azurerm_container_app" "app" {
 
   template {
     min_replicas = 0
-    max_replicas = 1
+    max_replicas = 3
+
+    http_scale_rule {
+      name                = "http-concurrency-rule"
+      concurrent_requests = "10"
+    }
 
     container {
       name   = "idp-engine"
@@ -90,8 +111,8 @@ resource "azurerm_container_app" "app" {
         value = azurerm_cognitive_deployment.gpt5_mini.name
       }
       env {
-        name  = "IDP_API_KEY"
-        value = var.idp_api_key
+        name        = "IDP_API_KEY"
+        secret_name = "idp-api-key"
       }
     }
   }

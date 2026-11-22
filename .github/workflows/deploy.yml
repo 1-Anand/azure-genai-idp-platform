@@ -9,9 +9,9 @@ on:
       - 'Dockerfile'
       - '.dockerignore'
 
+# Scoped permissions: minimum required at top-level
 permissions:
   contents: read
-  id-token: write # Required for requesting the OIDC JWT token
 
 jobs:
   test:
@@ -38,7 +38,11 @@ jobs:
     name: Build, Push to Docker Hub & Deploy to ACA
     needs: test
     runs-on: ubuntu-latest
-    if: github.repository == '1-Anand/azure-genai-idp-platform' # Prevents forks from attempting deployment
+    # Branch and fork guard: Only deploy on main branch in the canonical repository
+    if: github.repository == '1-Anand/azure-genai-idp-platform' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: read
+      id-token: write # Granted exclusively to the deploy job for OIDC token exchange
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
