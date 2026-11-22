@@ -1,0 +1,5 @@
+# Example input variables for Terraform deployment
+location             = "eastus"
+resource_group_name  = "rg-genai-idp-dev"
+docker_image         = "mcr.microsoft.com/azuredocs/aci-helloworld:latest"
+openai_model_version = "2025-08-07"
