@@ -48,7 +48,7 @@ resource "random_password" "api_key" {
 }
 
 locals {
-  effective_api_key = var.idp_api_key != "" ? var.idp_api_key : random_password.api_key.result
+  effective_api_key = nonsensitive(var.idp_api_key) != "" ? var.idp_api_key : random_password.api_key.result
 }
 
 # Serverless Azure Container Apps (Scale-to-Zero + System-Assigned Managed Identity)
